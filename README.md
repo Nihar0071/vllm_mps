@@ -67,7 +67,7 @@ Every improvement is data-driven and documented:
 ## Key Research Findings
 
 This project discovered non-trivial MPS-specific behaviours that are not
-documented elsewhere. Full details in [FINDINGS.md](FINDINGS.md).
+documented elsewhere. Full details in [FINDINGS.md](findings.md).
 
 **Finding 007 — `torch.tensor()` allocation costs ~0.9ms on MPS**
 Creating a small index tensor inside a hot loop (called 22× per token)
