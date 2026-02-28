@@ -175,6 +175,39 @@ class MPSMemoryPool:
         v = self._pool[ids_tensor, 1].reshape(-1, self.n_heads, self.d_k)
         return k, v
 
+    def gather_blocks_batched(
+        self,
+        block_tables: list[list[int]],
+        seq_lens: list[int],
+        max_seq_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused batched KV gather via Metal kernel.
+
+        Replaces ``B × gather_blocks()`` Python calls with one GPU dispatch.
+        Out-of-range token positions are zero-padded in the output.
+
+        Args:
+            block_tables: Per-sequence block ID lists (variable length).
+            seq_lens:     Valid token count per sequence.
+            max_seq_len:  Padding target (max of seq_lens).
+
+        Returns:
+            ``(K, V)`` each ``(B, max_seq_len, n_heads, d_k)`` float16 on MPS.
+        """
+        from vllm_mps.kernels import gather_kv_metal
+
+        B = len(block_tables)
+        max_blocks = max(len(bt) for bt in block_tables)
+
+        # Pad block tables to uniform [B, max_blocks]
+        bt_padded = torch.zeros(B, max_blocks, dtype=torch.int32, device=self.device)
+        for i, bt in enumerate(block_tables):
+            bt_padded[i, :len(bt)] = torch.tensor(bt, dtype=torch.int32)
+
+        sl = torch.tensor(seq_lens, dtype=torch.int32, device=self.device)
+
+        return gather_kv_metal(self._pool, bt_padded, sl, max_seq_len)
+
     def copy_block(self, src_block_id: int, dst_block_id: int) -> None:
         """Copy all KV data from *src* to *dst* in-place.
 

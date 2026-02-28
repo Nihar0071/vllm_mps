@@ -28,6 +28,10 @@ _batch_context.is_batch = False
 _batch_context.seq_ids = []
 _batch_context.positions = []
 _batch_context.seq_lens = []
+# Pre-built Metal kernel tensors (reused across 22 layers)
+_batch_context.bt_tensor = None      # [B, max_blocks] int32 MPS
+_batch_context.write_info = None     # [B, 2] int32 MPS
+_batch_context.sl_tensor = None      # [B] int32 MPS
 
 
 class LlamaAdapter(BaseModelAdapter):
@@ -166,6 +170,30 @@ class LlamaAdapter(BaseModelAdapter):
         _batch_context.seq_ids = seq_ids
         _batch_context.positions = positions
         _batch_context.seq_lens = seq_lens
+
+        # Pre-build Metal kernel tensors (reused across all 22 layers).
+        all_block_tables = [
+            self.kv_cache_manager.get_block_table(sid)
+            for sid in seq_ids
+        ]
+        max_blocks = max(len(bt) for bt in all_block_tables)
+        bt_tensor = torch.zeros(B, max_blocks, dtype=torch.int32, device=device)
+        for i, bt in enumerate(all_block_tables):
+            bt_tensor[i, :len(bt)] = torch.tensor(bt, dtype=torch.int32)
+        _batch_context.bt_tensor = bt_tensor
+
+        write_info = torch.zeros(B, 2, dtype=torch.int32, device=device)
+        write_blocks = []
+        write_positions_list = []
+        for i in range(B):
+            block_idx = positions[i] // self.paged_layers[0].block_size
+            token_pos = positions[i] % self.paged_layers[0].block_size
+            write_info[i, 0] = all_block_tables[i][block_idx]
+            write_info[i, 1] = token_pos
+        _batch_context.write_info = write_info
+        _batch_context.sl_tensor = torch.tensor(
+            seq_lens, dtype=torch.int32, device=device
+        )
 
         with torch.no_grad():
             outputs = self.hf_model(

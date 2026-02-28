@@ -11,11 +11,11 @@ DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 DTYPE  = torch.float16
 
 # ── Model dimensions — kept small for M1 8GB ─────────────────────────────────
-D_MODEL    = 64      # embedding dimension
-N_HEADS    = 4       # attention heads
-D_K        = D_MODEL // N_HEADS   # 16 — dims per head
-N_LAYERS   = 4       # transformer depth
-VOCAB_SIZE = 1000    # small vocab for experiments
+D_MODEL = 2048
+N_HEADS = 32
+D_K     = D_MODEL // N_HEADS   # 64 — dims per head
+N_LAYERS = 22                   # ← also fix this, TinyLlama has 22 layers not 4
+VOCAB_SIZE = 32000              # ← and this, TinyLlama has 32000 not 1000
 
 # ── Memory pool ───────────────────────────────────────────────────────────────
 BLOCK_SIZE         = 16    # tokens per physical block

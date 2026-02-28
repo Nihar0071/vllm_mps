@@ -285,58 +285,80 @@ class PagedAttentionLayer(nn.Module):
         Q_rot = torch.cat(Q_rot_list, dim=0)  # (B, n_heads, 1, d_k)
         K_rot = torch.cat(K_rot_list, dim=0)  # (B, n_kv_heads, 1, d_k)
 
-        # 3. Write new K, V to memory pool for each sequence.
-        for i in range(B):
-            block_ids = self.kv_cache_manager.get_block_table(seq_ids[i])
-            block_idx = positions[i] // self.block_size
-            token_pos = positions[i] % self.block_size
-            k_vec = K_rot[i, :, 0, :]  # (n_kv_heads, d_k)
-            v_vec = V_new[i, :, 0, :]  # (n_kv_heads, d_k)
-            self.memory_pool.write_kv(block_ids[block_idx], token_pos, k_vec, v_vec)
+        # ── Fix 5B: Fused Metal kernel (write+gather+attention in 1 dispatch) ──
+        use_metal_kernel = True
 
-        # 4. Gather KV history per sequence and pad to max_len.
-        max_len = max(seq_lens)
+        if use_metal_kernel:
+            from vllm_mps.kernels import fused_attention_metal_fast
+            from vllm_mps.models.llama_adapter import _batch_context as _bc
 
-        K_padded = torch.zeros(
-            B, max_len, self.n_kv_heads, self.d_k,
-            dtype=hidden_states.dtype, device=device,
-        )  # (B, max_len, n_kv_heads, d_k)
-        V_padded = torch.zeros_like(K_padded)
+            # K_rot: (B, n_kv_heads, 1, d_k) → (B, n_kv_heads, d_k)
+            # V_new: (B, n_kv_heads, 1, d_k) → (B, n_kv_heads, d_k)
+            # Q_rot: (B, n_heads, 1, d_k) → (B, n_heads, d_k)
+            attn_out = fused_attention_metal_fast(
+                pool=self.memory_pool._pool,
+                new_k=K_rot[:, :, 0, :],
+                new_v=V_new[:, :, 0, :],
+                queries=Q_rot[:, :, 0, :],
+                bt_tensor=_bc.bt_tensor,
+                sl_tensor=_bc.sl_tensor,
+                write_info=_bc.write_info,
+                n_heads=self.n_heads,
+                n_kv_heads=self.n_kv_heads,
+                d_k=self.d_k,
+                block_size=self.block_size,
+            )  # (B, n_heads, d_k)
 
-        # Attention mask: True = attend, False = mask out.
-        attn_mask = torch.zeros(
-            B, 1, 1, max_len, dtype=torch.bool, device=device,
-        )  # (B, 1, 1, max_len)
+            attn_out = attn_out.unsqueeze(1)  # (B, 1, n_heads, d_k)
+            attn_out = attn_out.view(B, 1, self.n_heads * self.d_k)  # (B, 1, d_model)
 
-        for i in range(B):
-            block_ids = self.kv_cache_manager.get_block_table(seq_ids[i])
-            ids_tensor = self._get_cached_ids_tensor(seq_ids[i], block_ids)
-            K_full, V_full = self.memory_pool.gather_blocks_tensor(ids_tensor)
-            slen = seq_lens[i]
-            K_padded[i, :slen] = K_full[:slen]  # (slen, n_kv_heads, d_k)
-            V_padded[i, :slen] = V_full[:slen]
-            attn_mask[i, 0, 0, :slen] = True
+        else:
+            # ── Python fallback (original path) ──────────────────────────
+            # 3. Write new K, V to memory pool for each sequence.
+            for i in range(B):
+                block_ids = self.kv_cache_manager.get_block_table(seq_ids[i])
+                block_idx = positions[i] // self.block_size
+                token_pos = positions[i] % self.block_size
+                k_vec = K_rot[i, :, 0, :]
+                v_vec = V_new[i, :, 0, :]
+                self.memory_pool.write_kv(block_ids[block_idx], token_pos, k_vec, v_vec)
 
-        # Reshape for attention: (B, n_kv_heads, max_len, d_k).
-        K_padded = K_padded.transpose(1, 2)
-        V_padded = V_padded.transpose(1, 2)
+            # 4. Gather KV history per sequence, pad to max_len.
+            max_len = max(seq_lens)
+            K_padded = torch.zeros(
+                B, max_len, self.n_kv_heads, self.d_k,
+                dtype=hidden_states.dtype, device=device,
+            )
+            V_padded = torch.zeros_like(K_padded)
+            attn_mask = torch.zeros(
+                B, 1, 1, max_len, dtype=torch.bool, device=device,
+            )
+            for i in range(B):
+                block_ids = self.kv_cache_manager.get_block_table(seq_ids[i])
+                ids_tensor = self._get_cached_ids_tensor(seq_ids[i], block_ids)
+                K_full, V_full = self.memory_pool.gather_blocks_tensor(ids_tensor)
+                slen = seq_lens[i]
+                K_padded[i, :slen] = K_full[:slen]
+                V_padded[i, :slen] = V_full[:slen]
+                attn_mask[i, 0, 0, :slen] = True
 
-        # 5. GQA expand (Fix 3: pre-built index).
-        if self._gqa_index is not None:
-            K_padded = K_padded[:, self._gqa_index, :, :]  # (B, n_heads, max_len, d_k)
-            V_padded = V_padded[:, self._gqa_index, :, :]
+            K_padded = K_padded.transpose(1, 2)
+            V_padded = V_padded.transpose(1, 2)
 
-        # 6. Masked scaled dot-product attention.
-        # Q_rot: (B, n_heads, 1, d_k), K_padded: (B, n_heads, max_len, d_k)
-        scores = torch.matmul(Q_rot, K_padded.transpose(-2, -1))  # (B, n_heads, 1, max_len)
-        scores = scores / math.sqrt(self.d_k)
-        scores = scores.masked_fill(~attn_mask, float("-inf"))
-        attn_weights = torch.softmax(scores, dim=-1)  # (B, n_heads, 1, max_len)
-        attn_out = torch.matmul(attn_weights, V_padded)  # (B, n_heads, 1, d_k)
+            if self._gqa_index is not None:
+                K_padded = K_padded[:, self._gqa_index, :, :]
+                V_padded = V_padded[:, self._gqa_index, :, :]
 
-        # 7. Combine heads and project.
-        attn_out = attn_out.transpose(1, 2).contiguous()  # (B, 1, n_heads, d_k)
-        attn_out = attn_out.view(B, 1, self.n_heads * self.d_k)  # (B, 1, d_model)
+            scores = torch.matmul(Q_rot, K_padded.transpose(-2, -1))
+            scores = scores / math.sqrt(self.d_k)
+            scores = scores.masked_fill(~attn_mask, float("-inf"))
+            attn_weights = torch.softmax(scores, dim=-1)
+            attn_out = torch.matmul(attn_weights, V_padded)
+
+            attn_out = attn_out.transpose(1, 2).contiguous()
+            attn_out = attn_out.view(B, 1, self.n_heads * self.d_k)
+
+        # 7. Project output.
         output = self.W_O(attn_out)  # (B, 1, d_model)
 
         return (output, None)
